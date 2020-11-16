@@ -1,0 +1,102 @@
+image: registry.tokagroup.internal/toka/aux/dockerbuilder:latest
+variables:
+  DOCKER_DRIVER: overlay2
+  GIT_SUBMODULE_STRATEGY: recursive
+  GET_SOURCES_ATTEMPTS: 3
+
+stages:
+  - build
+  - deploy
+
+.docker-login:  &dockerLogin
+  before_script:
+    - docker version
+    - docker-compose version
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+
+build_dockers:
+  stage: build
+  <<: *dockerLogin
+  script:
+    - |
+      if [ "${FORCE_REBUILD}" == "true" ] || [ -z "${CI_COMMIT_TAG}" ] || [ -z $(docker images -q ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}) ]; then
+        echo "Building Docker $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA (BUILD_ARGS: ${BUILD_ARGS})"
+        docker build --pull -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" \
+           --build-arg CI_COMMIT_SHA="${CI_COMMIT_SHA}" \
+           --build-arg CI_PROJECT_PATH="${CI_PROJECT_PATH}" \
+           --build-arg CI_COMMIT_REF_NAME="${CI_COMMIT_REF_NAME}" \
+           --build-arg CI_PIPELINE_ID="${CI_PIPELINE_ID}" \
+           ${BUILD_ARGS} \
+            .
+      else
+        echo "Docker image $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA was already built on previous build. Will not rebuild."
+      fi
+
+push_registry_dev:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  <<: *dockerLogin
+  script:
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG"
+    - docker push "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG"
+  only:
+    - branches
+  except:
+    - /^(release\/.+|master)$/
+
+push_registry_master:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  <<: *dockerLogin
+  script:
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:latest"
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE:latest"
+  only:
+    - master
+  except:
+    - tags
+
+push_registry_release:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  <<: *dockerLogin
+  script:
+    - VERSION=$(bash ./bump_ver.sh)
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:$VERSION-pre"
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE:$VERSION-pre"
+  only:
+    - /^release\/.+$/
+  except:
+    - tags
+
+push_registry_tag:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker login -u "$EXT_REGISTRY_USER" -p "$EXT_REGISTRY_PASSWORD" $EXT_REGISTRY
+  script:
+    - TAG=$(echo $CI_COMMIT_TAG | grep -ioP '(v)?\K(.+)' )  # trim the 'v' from the beginning
+    - TAG_MINOR=$(echo $TAG | cut -d. -f1-3)  # is the tag is x.y.z.t, we want to tag x.y.z as well.
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:$TAG"
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:$TAG_MINOR"
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$EXT_REGISTRY/$CI_PROJECT_PATH:$TAG"
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$EXT_REGISTRY/$CI_PROJECT_PATH:$TAG_MINOR"
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE:$TAG"
+    - docker push "$CI_REGISTRY_IMAGE:$TAG_MINOR"
+    - docker push "$EXT_REGISTRY/$CI_PROJECT_PATH:$TAG"
+    - docker push "$EXT_REGISTRY/$CI_PROJECT_PATH:$TAG_MINOR"
+  only:
+    - /v.*$/
+  except:
+    # only tags
+    - branches
+    - triggers
+    - schedules
